@@ -1,17 +1,22 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::Result;
 use aws_config::{identity::IdentityCache, BehaviorVersion, SdkConfig};
-use aws_sdk_sqs::Client;
+use aws_sdk_sqs::{
+    error::SdkError, operation::list_queues::ListQueuesError, types::QueueAttributeName, Client,
+};
 use aws_types::region::Region;
 use clap::Parser;
-use futures::{future::join_all, prelude::*};
-use std::{collections::HashMap, time::Duration};
-use tracing::{debug, error};
+use colored::Colorize;
+use futures::prelude::*;
+use serde::Deserialize;
+use serde_json::from_str;
+use std::{collections::HashSet, time::Duration};
+use tracing::debug;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 /// List the status of AWS SQS queues.
 ///
 /// You can set the environment variable `RUST_LOG` to
-/// adjust logging, for example `RUST_LOG=trace available-enis`.
+/// adjust logging, for example `RUST_LOG=trace sqs-status`.
 #[derive(Clone, Debug, Parser)]
 #[command(about, author, version)]
 struct MyArgs {
@@ -45,6 +50,87 @@ async fn aws_sdk_config(args: &MyArgs) -> SdkConfig {
     with_overrides.load().await
 }
 
+#[derive(Deserialize)]
+struct RedrivePolicy {
+    #[serde(alias = "deadLetterTargetArn")]
+    dead_letter_target_arn: String,
+}
+
+#[derive(Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+struct QueueInfo {
+    name: String,
+    available: String,
+    delayed: String,
+    not_visible: String,
+    dead_letter_queue_name: String,
+}
+
+async fn queue_info(client: &Client, queue_url: String) -> Result<QueueInfo> {
+    let empty = "".to_string();
+    let zero = "0".to_string();
+    let attributes = client
+        .get_queue_attributes()
+        .queue_url(&queue_url)
+        .set_attribute_names(
+            vec![
+                QueueAttributeName::ApproximateNumberOfMessages,
+                QueueAttributeName::ApproximateNumberOfMessagesDelayed,
+                QueueAttributeName::ApproximateNumberOfMessagesNotVisible,
+                QueueAttributeName::RedriveAllowPolicy,
+                QueueAttributeName::RedrivePolicy,
+            ]
+            .into(),
+        )
+        .send()
+        .await?
+        .attributes
+        .unwrap_or_default();
+    Ok(QueueInfo {
+        name: queue_url,
+        available: attributes
+            .get(&QueueAttributeName::ApproximateNumberOfMessages)
+            .unwrap_or(&zero)
+            .to_string(),
+        delayed: attributes
+            .get(&QueueAttributeName::ApproximateNumberOfMessagesDelayed)
+            .unwrap_or(&zero)
+            .to_string(),
+        not_visible: attributes
+            .get(&QueueAttributeName::ApproximateNumberOfMessagesNotVisible)
+            .unwrap_or(&zero)
+            .to_string(),
+        dead_letter_queue_name: match attributes.get(&QueueAttributeName::RedrivePolicy) {
+            Some(redrive) => match from_str::<RedrivePolicy>(redrive) {
+                Ok(redrive_policy) => redrive_policy
+                    .dead_letter_target_arn
+                    .split(':')
+                    .last()
+                    .unwrap_or(&empty)
+                    .to_string(),
+                Err(_) => empty,
+            },
+            None => empty,
+        },
+    })
+}
+
+/*
+    let results: Vec<Result<Vec<FunctionVersions>>> = stream::iter(function_names)
+        .map(|name| function_versions(&client, name))
+        .buffer_unordered(CONCURRENT_REQUESTS)
+        .collect()
+        .await;
+*/
+
+async fn gather_status(client: &Client, queue_urls: Vec<String>) -> Result<Vec<QueueInfo>> {
+    let vec_result: Vec<Result<QueueInfo>> = stream::iter(queue_urls)
+        .map(|queue_url| queue_info(client, queue_url))
+        .buffer_unordered(256)
+        .collect()
+        .await;
+    vec_result.into_iter().collect()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::registry()
@@ -55,5 +141,49 @@ async fn main() -> Result<()> {
     let config = aws_sdk_config(&args).await;
     debug!("Config: {:#?}", config);
     let client = Client::new(&config);
+    let queue_urls = client
+        .list_queues()
+        .into_paginator()
+        .items()
+        .send()
+        .collect::<Result<Vec<String>, SdkError<ListQueuesError>>>()
+        .await?;
+    println!("Found {} SQS queues", queue_urls.len());
+
+    let mut results = gather_status(&client, queue_urls).await?;
+    results.sort_unstable();
+    let dead_letter_queue_names: HashSet<String> = results
+        .iter()
+        .map(|item| item.dead_letter_queue_name.clone())
+        .collect();
+    let mut first = true;
+    for item in results {
+        if item.available != "0" || item.delayed != "0" || item.not_visible != "0" {
+            if first {
+                first = false;
+                println!(
+                    "{:>9}  {:>7}  {:>11}  {}  (each {} can be redriven)",
+                    "available".bold(),
+                    "delayed".bold(),
+                    "not_visible".bold(),
+                    "name".bold(),
+                    "name in italic".italic(),
+                );
+            }
+            let queue_name = item.name.split('/').last().unwrap_or_default();
+            let formatted_queue_name = if dead_letter_queue_names.contains(queue_name) {
+                queue_name.italic()
+            } else {
+                queue_name.normal()
+            };
+            println!(
+                "{:>9}  {:>7}  {:>11}  {} ",
+                item.available, item.delayed, item.not_visible, formatted_queue_name,
+            );
+        }
+    }
+    if first {
+        println!("No in flight messages found in any queues.");
+    }
     Ok(())
 }
