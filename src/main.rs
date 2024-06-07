@@ -20,6 +20,10 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 #[derive(Clone, Debug, Parser)]
 #[command(about, author, version)]
 struct MyArgs {
+    /// Print all SQS queues instead of only non-empty queues.
+    #[arg(long, short)]
+    all: bool,
+
     /// AWS profile to use.
     ///
     /// This overrides the standard (and complex!) AWS profile handling.
@@ -131,34 +135,14 @@ async fn gather_status(client: &Client, queue_urls: Vec<String>) -> Result<Vec<Q
     vec_result.into_iter().collect()
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::registry()
-        .with(fmt::layer())
-        .with(EnvFilter::from_default_env())
-        .init();
-    let args = MyArgs::parse();
-    let config = aws_sdk_config(&args).await;
-    debug!("Config: {:#?}", config);
-    let client = Client::new(&config);
-    let queue_urls = client
-        .list_queues()
-        .into_paginator()
-        .items()
-        .send()
-        .collect::<Result<Vec<String>, SdkError<ListQueuesError>>>()
-        .await?;
-    println!("Found {} SQS queues", queue_urls.len());
-
-    let mut results = gather_status(&client, queue_urls).await?;
-    results.sort_unstable();
+fn report_status(results: &Vec<QueueInfo>, all: bool) {
     let dead_letter_queue_names: HashSet<String> = results
         .iter()
         .map(|item| item.dead_letter_queue_name.clone())
         .collect();
     let mut first = true;
     for item in results {
-        if item.available != "0" || item.delayed != "0" || item.not_visible != "0" {
+        if all || item.available != "0" || item.delayed != "0" || item.not_visible != "0" {
             if first {
                 first = false;
                 println!(
@@ -184,6 +168,33 @@ async fn main() -> Result<()> {
     }
     if first {
         println!("No in flight messages found in any queues.");
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::registry()
+        .with(fmt::layer())
+        .with(EnvFilter::from_default_env())
+        .init();
+    let args = MyArgs::parse();
+    let config = aws_sdk_config(&args).await;
+    debug!("Config: {:#?}", config);
+    let client = Client::new(&config);
+    let queue_urls = client
+        .list_queues()
+        .into_paginator()
+        .items()
+        .send()
+        .collect::<Result<Vec<String>, SdkError<ListQueuesError>>>()
+        .await?;
+    if queue_urls.is_empty() {
+        println!("No SQS queues found");
+    } else {
+        println!("Found {} SQS queues", queue_urls.len());
+        let mut results = gather_status(&client, queue_urls).await?;
+        results.sort_unstable();
+        report_status(&results, args.all);
     }
     Ok(())
 }
