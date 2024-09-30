@@ -1,8 +1,6 @@
 use anyhow::Result;
 use aws_config::{identity::IdentityCache, BehaviorVersion, SdkConfig};
-use aws_sdk_sqs::{
-    error::SdkError, operation::list_queues::ListQueuesError, types::QueueAttributeName, Client,
-};
+use aws_sdk_sqs::{types::QueueAttributeName, Client};
 use aws_types::region::Region;
 use clap::Parser;
 use colored::Colorize;
@@ -183,10 +181,11 @@ async fn main() -> Result<()> {
     let client = Client::new(&config);
     let queue_urls = client
         .list_queues()
+        .max_results(1000) // This is required to retrieve multiple pages!!
         .into_paginator()
         .items()
         .send()
-        .collect::<Result<Vec<String>, SdkError<ListQueuesError>>>()
+        .collect::<Result<Vec<_>, _>>()
         .await?;
     if queue_urls.is_empty() {
         println!("No SQS queues found");
