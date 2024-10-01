@@ -4,7 +4,7 @@ version = "0.1.0"
 authors = ["Bruce Adams <bruce.adams@acm.org>"]
 description = "List the status of AWS SQS queues"
 edition = "2021"
-homepage = "https://github.com/bruceadams/yj"
+homepage = "https://github.com/bruceadams/sqs-status"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/bruceadams/sqs-status"
 
