@@ -1,6 +1,6 @@
 [package]
 name = "sqs-status"
-version = "0.3.1"
+version = "0.3.3"
 authors = ["Bruce Adams <bruce.adams@acm.org>"]
 description = "List the status of AWS SQS queues"
 edition = "2021"
